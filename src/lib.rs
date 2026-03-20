@@ -1,45 +1,34 @@
 // SPDX-License-Identifier: GPL-3.0
-//! # alterion-rsa-key-manager
+//! # alterion-ecdh
 //!
-//! RSA-2048 key store with timed rotation, a 300-second grace window, and OAEP-SHA256 decryption.
+//! X25519 ECDH key store with timed rotation, a 300-second grace window, and HKDF-SHA256
+//! session key derivation — the key exchange layer for the
+//! [alterion-enc-pipeline](https://crates.io/crates/alterion-enc-pipeline).
 //!
 //! ## Example
 //!
 //! ```rust,no_run
-//! use alterion_rsa_key_manager::{init_key_store, start_rotation, get_current_public_key, decrypt};
-//! use actix_web::{web, App, HttpServer, get, HttpResponse};
-//! use std::sync::Arc;
-//! use tokio::sync::RwLock;
-//! use alterion_rsa_key_manager::KeyStore;
+//! use alterion_ecdh::{init_key_store, start_rotation, get_current_public_key, ecdh};
 //!
-//! #[get("/api/pubkey")]
-//! async fn pubkey_handler(
-//!     store: web::Data<Arc<RwLock<KeyStore>>>,
-//! ) -> HttpResponse {
-//!     let (key_id, pem) = get_current_public_key(&store).await;
-//!     HttpResponse::Ok().json(serde_json::json!({ "key_id": key_id, "public_key": pem }))
-//! }
-//!
-//! #[actix_web::main]
-//! async fn main() -> std::io::Result<()> {
-//!     // Rotate every hour; previous key stays live for 5 minutes (grace window).
+//! #[tokio::main]
+//! async fn main() {
+//!     // Rotate keys every hour; grace window keeps the previous key live for 5 minutes.
 //!     let store = init_key_store(3600);
 //!     start_rotation(store.clone(), 3600);
 //!
-//!     HttpServer::new(move || {
-//!         App::new()
-//!             .app_data(web::Data::new(store.clone()))
-//!             .service(pubkey_handler)
-//!     })
-//!     .bind("0.0.0.0:8080")?
-//!     .run()
-//!     .await
+//!     // Serve the current public key to clients so they can build WrappedPackets.
+//!     let (key_id, public_key_b64) = get_current_public_key(&store).await;
+//!
+//!     // On an incoming request: perform ECDH with the client's ephemeral key.
+//!     let client_pk: [u8; 32] = [0u8; 32]; // received from client
+//!     let (shared_secret, server_pk) = ecdh(&store, &key_id, &client_pk).await.unwrap();
+//!     // Pass shared_secret + both public keys to HKDF to derive enc/mac session keys.
 //! }
 //! ```
 
 pub mod keystore;
 
 pub use keystore::{
-    KeyStore, KeyEntry, RsaError,
-    init_key_store, start_rotation, get_current_public_key, decrypt,
+    KeyStore, KeyEntry, EcdhError,
+    init_key_store, start_rotation, get_current_public_key, ecdh,
 };
