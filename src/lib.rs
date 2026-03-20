@@ -8,13 +8,14 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use alterion_ecdh::{init_key_store, start_rotation, get_current_public_key, ecdh};
+//! use alterion_ecdh::{init_key_store, init_handshake_store, start_rotation, get_current_public_key, ecdh};
 //!
 //! #[tokio::main]
 //! async fn main() {
 //!     // Rotate keys every hour; grace window keeps the previous key live for 5 minutes.
 //!     let store = init_key_store(3600);
-//!     start_rotation(store.clone(), 3600);
+//!     let hs    = init_handshake_store();
+//!     start_rotation(store.clone(), 3600, hs.clone());
 //!
 //!     // Serve the current public key to clients so they can build WrappedPackets.
 //!     let (key_id, public_key_b64) = get_current_public_key(&store).await;
@@ -29,6 +30,8 @@
 pub mod keystore;
 
 pub use keystore::{
-    KeyStore, KeyEntry, EcdhError,
-    init_key_store, start_rotation, get_current_public_key, ecdh,
+    KeyStore, KeyEntry, EcdhError, HandshakeStore,
+    init_key_store, init_handshake_store,
+    start_rotation, get_current_public_key,
+    ecdh, init_handshake, ecdh_ephemeral, prune_handshakes,
 };

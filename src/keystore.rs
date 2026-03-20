@@ -6,6 +6,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+use dashmap::DashMap;
 
 pub struct KeyEntry {
     pub key_id:         String,
@@ -24,6 +25,21 @@ pub struct KeyStore {
     pub next:     Option<KeyEntry>,
 }
 
+/// A single-use ephemeral server key pair created by [`init_handshake`].
+/// Consumed and removed by the first [`ecdh`] call that references its ID.
+struct HandshakeEntry {
+    secret:     StaticSecret,
+    public_raw: [u8; 32],
+    expires_at: DateTime<Utc>,
+}
+
+/// Thread-safe store of pending ephemeral handshake entries, keyed by handshake ID.
+///
+/// Separate from [`KeyStore`] so that handshake writes (use-once removals) never contend
+/// with the read-heavy static key lock.
+#[derive(Clone)]
+pub struct HandshakeStore(Arc<DashMap<String, HandshakeEntry>>);
+
 #[derive(Debug, thiserror::Error)]
 pub enum EcdhError {
     #[error("key_expired")]
@@ -34,8 +50,9 @@ pub enum EcdhError {
     KeyGenerationFailed(String),
 }
 
-const KEY_GRACE_SECS:     u64 = 300;
-const KEY_WARM_LEAD_SECS: u64 = 600;
+const KEY_GRACE_SECS:       u64 = 300;
+const KEY_WARM_LEAD_SECS:   u64 = 600;
+const HANDSHAKE_TTL_SECS:   i64 = 60;
 
 fn generate_entry(interval_secs: u64) -> KeyEntry {
     let secret     = StaticSecret::random_from_rng(rand::thread_rng());
@@ -63,13 +80,61 @@ pub fn init_key_store(interval_secs: u64) -> Arc<RwLock<KeyStore>> {
     }))
 }
 
+/// Creates an empty `HandshakeStore`. Call once at startup and share the handle across all workers.
+pub fn init_handshake_store() -> HandshakeStore {
+    HandshakeStore(Arc::new(DashMap::new()))
+}
+
+/// Generates a fresh ephemeral X25519 key pair, stores the private key in `hs` with a 60-second
+/// TTL, and returns `(handshake_id, base64_public_key)`.
+///
+/// The private key is consumed and deleted on the first matching [`ecdh_ephemeral`] call.
+/// Any entry not consumed within `HANDSHAKE_TTL_SECS` is pruned by [`prune_handshakes`].
+pub fn init_handshake(hs: &HandshakeStore) -> (String, String) {
+    let secret     = StaticSecret::random_from_rng(rand::thread_rng());
+    let public_key = PublicKey::from(&secret);
+    let raw        = *public_key.as_bytes();
+    let id         = format!("hs_{}", Uuid::new_v4());
+    hs.0.insert(id.clone(), HandshakeEntry {
+        secret,
+        public_raw: raw,
+        expires_at: Utc::now() + Duration::seconds(HANDSHAKE_TTL_SECS),
+    });
+    (id, B64.encode(raw))
+}
+
+/// Performs a use-once X25519 ECDH using a handshake entry created by [`init_handshake`].
+/// Removes the entry on success — replaying the same handshake ID returns `EcdhError::KeyExpired`.
+pub async fn ecdh_ephemeral(
+    hs:              &HandshakeStore,
+    handshake_id:    &str,
+    client_pk_bytes: &[u8; 32],
+) -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), EcdhError> {
+    let entry = hs.0.remove(handshake_id)
+        .ok_or(EcdhError::KeyExpired)?;
+    let (_, entry) = entry;
+    if Utc::now() > entry.expires_at {
+        return Err(EcdhError::KeyExpired);
+    }
+    let client_public = PublicKey::from(*client_pk_bytes);
+    let shared        = entry.secret.diffie_hellman(&client_public);
+    Ok((Zeroizing::new(*shared.as_bytes()), entry.public_raw))
+}
+
+/// Removes all expired handshake entries from `hs`. Call periodically (e.g. every 30 seconds).
+pub fn prune_handshakes(hs: &HandshakeStore) {
+    let now = Utc::now();
+    hs.0.retain(|_, v| v.expires_at > now);
+}
+
 /// Spawns two background tasks:
 /// - **Warm-up**: generates the next key `KEY_WARM_LEAD_SECS` before each rotation and stores it
 ///   in `KeyStore::next` so key generation never blocks the hot path.
 /// - **Rotation**: swaps `next` (or falls back to a fresh key) into `current` and retires the old
 ///   key to `previous` for the grace-window period.
-/// - **Cleanup**: prunes `previous` once its grace window expires.
-pub fn start_rotation(store: Arc<RwLock<KeyStore>>, interval_secs: u64) {
+/// - **Cleanup**: prunes `previous` once its grace window expires, and prunes expired handshake
+///   entries from `hs` every 30 seconds.
+pub fn start_rotation(store: Arc<RwLock<KeyStore>>, interval_secs: u64, hs: HandshakeStore) {
     let warm_lead = KEY_WARM_LEAD_SECS.min(interval_secs.saturating_sub(1));
     let warm_offset = interval_secs.saturating_sub(warm_lead);
 
@@ -117,6 +182,7 @@ pub fn start_rotation(store: Arc<RwLock<KeyStore>>, interval_secs: u64) {
                         store_rotate.write().await.previous = None;
                         tracing::debug!("previous X25519 key pruned");
                     }
+                    prune_handshakes(&hs);
                 }
             }
         }
