@@ -9,12 +9,12 @@
 <div align="center">
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
-[![Crates.io](https://img.shields.io/crates/v/alterion-rsa-key-manager.svg)](https://crates.io/crates/alterion-rsa-key-manager)
+[![Crates.io](https://img.shields.io/crates/v/alterion-ecdh.svg)](https://crates.io/crates/alterion-ecdh)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange?style=flat&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![RSA-2048](https://img.shields.io/badge/RSA--2048-OAEP--SHA256-blue?style=flat)](https://docs.rs/rsa)
+[![X25519](https://img.shields.io/badge/X25519-ECDH-blue?style=flat)](https://docs.rs/x25519-dalek)
 [![GitHub](https://img.shields.io/badge/GitHub-Alterion--Software-181717?style=flat&logo=github&logoColor=white)](https://github.com/Alterion-Software)
 
-_RSA-2048 key store with timed rotation, a 300-second grace window, and OAEP-SHA256 decryption — designed as the key management layer for the [alterion-enc-pipeline](https://crates.io/crates/alterion-enc-pipeline)._
+_X25519 ECDH key store with timed rotation, a 300-second grace window, and HKDF-SHA256 session key derivation — designed as the key exchange layer for the [alterion-enc-pipeline](https://crates.io/crates/alterion-enc-pipeline)._
 
 ---
 
@@ -22,17 +22,17 @@ _RSA-2048 key store with timed rotation, a 300-second grace window, and OAEP-SHA
 
 ## What it does
 
-Manages a live RSA-2048 key pair that rotates automatically on a configurable interval. A 300-second grace window keeps the previous key valid after rotation so any in-flight request encrypted just before a rotation still decrypts successfully.
+Manages a live X25519 key pair that rotates automatically on a configurable interval. A 300-second grace window keeps the previous key valid after rotation so any in-flight request sent just before a rotation still completes successfully.
 
 ```
 ┌─────────────────────────────────────────────┐
 │                  KeyStore                    │
-│  current  ──→  active RSA key pair           │
+│  current  ──→  active X25519 key pair        │
 │  previous ──→  retiring key (≤300s grace)    │
 └─────────────────────────────────────────────┘
 ```
 
-Decryption automatically falls back to the previous key within its grace window and returns `RsaError::KeyExpired` once the window closes.
+On each request the client performs X25519 ECDH with the server's current public key. The resulting shared secret is passed to HKDF-SHA256 to derive separate `enc_key` and `mac_key` — both parties derive identical keys without ever transmitting them.
 
 ---
 
@@ -42,22 +42,21 @@ Decryption automatically falls back to the previous key within its grace window 
 
 ```toml
 [dependencies]
-alterion-rsa-key-manager = "0.1"
+alterion-ecdh = "0.1"
 ```
 
 ### 2. Initialise and rotate
 
 ```rust
-use alterion_rsa_key_manager::{init_key_store, start_rotation};
+use alterion_ecdh::{init_key_store, start_rotation};
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() {
     // Rotate every hour; previous key stays live for 5 minutes.
     let store = init_key_store(3600);
     start_rotation(store.clone(), 3600);
 
     // pass `store` into your application state
-    Ok(())
 }
 ```
 
@@ -65,7 +64,7 @@ async fn main() -> std::io::Result<()> {
 
 ```rust
 use actix_web::{get, web, HttpResponse};
-use alterion_rsa_key_manager::{KeyStore, get_current_public_key};
+use alterion_ecdh::{KeyStore, get_current_public_key};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -73,19 +72,24 @@ use tokio::sync::RwLock;
 async fn public_key_handler(
     store: web::Data<Arc<RwLock<KeyStore>>>,
 ) -> HttpResponse {
-    let (key_id, pem) = get_current_public_key(&store).await;
-    HttpResponse::Ok().json(serde_json::json!({ "key_id": key_id, "public_key": pem }))
+    let (key_id, public_key_b64) = get_current_public_key(&store).await;
+    HttpResponse::Ok().json(serde_json::json!({ "key_id": key_id, "public_key": public_key_b64 }))
 }
 ```
 
-### 4. Decrypt an RSA-OAEP-SHA256 ciphertext
+The `public_key` field is a base64-encoded 32-byte X25519 public key. The client uses it to generate an ephemeral key pair and perform ECDH.
+
+### 4. Perform ECDH on an incoming request
 
 ```rust
-use alterion_rsa_key_manager::decrypt;
+use alterion_ecdh::ecdh;
 
-let plaintext = decrypt(&store, &key_id, &ciphertext).await?;
-// plaintext is Zeroizing<Vec<u8>> — memory is wiped on drop
+// client_pk is the 32-byte ephemeral X25519 public key sent by the client
+let (shared_secret, server_pk) = ecdh(&store, &key_id, &client_pk).await?;
+// Pass shared_secret + both public keys to HKDF to derive enc_key and mac_key
 ```
+
+`shared_secret` is `Zeroizing<[u8; 32]>` — memory is wiped on drop.
 
 ---
 
@@ -93,18 +97,17 @@ let plaintext = decrypt(&store, &key_id, &ciphertext).await?;
 
 | Function | Description |
 |---|---|
-| `init_key_store(interval_secs)` | Generates the initial RSA-2048 key pair, returns `Arc<RwLock<KeyStore>>` |
+| `init_key_store(interval_secs)` | Generates the initial X25519 key pair, returns `Arc<RwLock<KeyStore>>` |
 | `start_rotation(store, interval_secs)` | Spawns a background task that rotates the key every `interval_secs` seconds |
-| `get_current_public_key(store)` | Returns `(key_id, pem)` for the active key |
-| `decrypt(store, key_id, cdata)` | RSA-OAEP-SHA256 decrypts `cdata`, falling back to the previous key within its grace window |
+| `get_current_public_key(store)` | Returns `(key_id, base64_public_key)` for the active key |
+| `ecdh(store, key_id, client_pk)` | Performs X25519 ECDH, returns `(Zeroizing<[u8; 32]>, [u8; 32])` — shared secret and server public key bytes |
 
-### `RsaError`
+### `EcdhError`
 
 | Variant | Meaning |
 |---|---|
 | `KeyExpired` | The `key_id` is unknown or its grace window has closed |
-| `DecryptionFailed(String)` | OAEP decryption failed (bad ciphertext or wrong key) |
-| `KeyGenerationFailed(String)` | RSA key generation failed at startup or rotation |
+| `InvalidPublicKey` | The client's public key is not a valid 32-byte X25519 point |
 
 ---
 
