@@ -1,0 +1,21 @@
+[package]
+name = "alterion-rsa-key-manager"
+version = "0.1.0"
+authors = ["Alterion Software"]
+edition = "2024"
+description = "RSA-2048 key store with timed rotation, grace-window overlap, and OAEP-SHA256 decryption."
+license = "GPL-3.0"
+repository = "https://github.com/Alterion-Software/rsa-key-manager"
+
+[dependencies]
+rsa   = { version = "0.9", features = ["sha2"] }
+pkcs8 = { version = "0.10", features = ["alloc", "pkcs5", "encryption"] }
+sha2  = "0.10"
+
+chrono    = { version = "0.4", features = ["serde"] }
+uuid      = { version = "1", features = ["v4"] }
+zeroize   = { version = "1.8", features = ["derive"] }
+rand      = "0.8"
+thiserror = "2"
+tracing   = "0.1"
+tokio     = { version = "1", features = ["full"] }
