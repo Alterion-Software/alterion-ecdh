@@ -14,7 +14,7 @@ If you discover a security vulnerability in `alterion-ecdh`, **please do not ope
 
 Report it privately by emailing:
 
-**chaceberry686@gmail.com**
+**security@alterion.dpdns.org**
 
 Please include:
 - A description of the vulnerability
