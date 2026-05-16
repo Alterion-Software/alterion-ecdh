@@ -9,12 +9,23 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 use dashmap::DashMap;
 
+/// A single X25519 key pair entry managed by [`KeyStore`].
+///
+/// Derives [`zeroize::ZeroizeOnDrop`] so that `secret` is guaranteed to be zeroed whenever
+/// a `KeyEntry` is dropped — including when it is moved or replaced during key rotation —
+/// regardless of whether the compiler relocated the struct in memory beforehand.
+#[derive(zeroize::ZeroizeOnDrop)]
 pub struct KeyEntry {
-    pub key_id:         String,
-    pub public_key_b64: String,
-    pub public_key_raw: [u8; 32],
     pub secret:         StaticSecret,
+    #[zeroize(skip)]
+    pub key_id:         String,
+    #[zeroize(skip)]
+    pub public_key_b64: String,
+    #[zeroize(skip)]
+    pub public_key_raw: [u8; 32],
+    #[zeroize(skip)]
     pub created_at:     DateTime<Utc>,
+    #[zeroize(skip)]
     pub expires_at:     DateTime<Utc>,
 }
 
@@ -51,9 +62,13 @@ pub enum EcdhError {
     KeyGenerationFailed(String),
 }
 
-const KEY_GRACE_SECS:       u64 = 300;
-const KEY_WARM_LEAD_SECS:   u64 = 600;
-const HANDSHAKE_TTL_SECS:   i64 = 60;
+const KEY_GRACE_SECS:       u64   = 300;
+const KEY_WARM_LEAD_SECS:   u64   = 600;
+const HANDSHAKE_TTL_SECS:   i64   = 60;
+/// Maximum number of pending handshake entries. Prevents memory exhaustion from a handshake flood.
+/// Returns `None` from [`init_handshake`] when the cap is reached; the ECDH endpoint should
+/// respond with 503 Service Unavailable in that case.
+pub const MAX_HANDSHAKES:   usize = 10_000;
 
 fn generate_entry(interval_secs: u64) -> KeyEntry {
     let secret     = StaticSecret::random_from_rng(OsRng);
@@ -87,11 +102,16 @@ pub fn init_handshake_store() -> HandshakeStore {
 }
 
 /// Generates a fresh ephemeral X25519 key pair, stores the private key in `hs` with a 60-second
-/// TTL, and returns `(handshake_id, base64_public_key)`.
+/// TTL, and returns `Some((handshake_id, base64_public_key))`.
 ///
-/// The private key is consumed and deleted on the first matching [`ecdh_ephemeral`] call.
-/// Any entry not consumed within `HANDSHAKE_TTL_SECS` is pruned by [`prune_handshakes`].
-pub fn init_handshake(hs: &HandshakeStore) -> (String, String) {
+/// Returns `None` when the store is at capacity ([`MAX_HANDSHAKES`]); callers should respond with
+/// 503 Service Unavailable. The private key is consumed on the first matching [`ecdh_ephemeral`]
+/// call. Any entry not consumed within `HANDSHAKE_TTL_SECS` is pruned by [`prune_handshakes`].
+pub fn init_handshake(hs: &HandshakeStore) -> Option<(String, String)> {
+    if hs.0.len() >= MAX_HANDSHAKES {
+        tracing::warn!("alterion-ecdh: handshake store at capacity — rejecting new handshake");
+        return None;
+    }
     let secret     = StaticSecret::random_from_rng(OsRng);
     let public_key = PublicKey::from(&secret);
     let raw        = *public_key.as_bytes();
@@ -101,7 +121,7 @@ pub fn init_handshake(hs: &HandshakeStore) -> (String, String) {
         public_raw: raw,
         expires_at: Utc::now() + Duration::seconds(HANDSHAKE_TTL_SECS),
     });
-    (id, B64.encode(raw))
+    Some((id, B64.encode(raw)))
 }
 
 /// Performs a use-once X25519 ECDH using a handshake entry created by [`init_handshake`].
